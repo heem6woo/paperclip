@@ -374,7 +374,48 @@ describe("agent routes adapter validation", () => {
     expect(res.body.adapterType).toBe("external_test");
   });
 
-  it("does not inject CODEX_HOME or OPENAI_API_KEY when creating a keyless codex_local agent", async () => {
+  function expectPerAgentCodexHome(value: unknown, agentId: string) {
+    expect(typeof value).toBe("string");
+    expect(path.isAbsolute(String(value))).toBe(true);
+    expect(String(value).endsWith(path.join("companies", "company-1", "agents", agentId, "codex-home"))).toBe(true);
+  }
+
+  function storedCodexAgent(adapterConfig: Record<string, unknown>, runtimeConfig: Record<string, unknown> = {}) {
+    return {
+      id: "11111111-1111-4111-8111-111111111111",
+      companyId: "company-1",
+      name: "Codex",
+      urlKey: "codex",
+      role: "engineer",
+      title: null,
+      icon: null,
+      status: "idle",
+      reportsTo: null,
+      capabilities: null,
+      adapterType: "codex_local",
+      adapterConfig,
+      runtimeConfig,
+      budgetMonthlyCents: 0,
+      spentMonthlyCents: 0,
+      pauseReason: null,
+      pausedAt: null,
+      permissions: { canCreateAgents: false },
+      lastHeartbeatAt: null,
+      metadata: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+  }
+
+  it.each([
+    ["no env", {}, {}],
+    ["an empty env", { env: {} }, {}],
+    [
+      "a subscription env with no key",
+      { model: "gpt-5.4", env: { OPENAI_API_KEY: "", FEATURE_FLAG: "on" } },
+      { OPENAI_API_KEY: "", FEATURE_FLAG: "on" },
+    ],
+  ])("persists its own per-agent CODEX_HOME for a keyless codex_local agent with %s", async (_label, adapterConfig, expectedCredentialEnv) => {
     const app = await createApp();
     const res = await requestApp(app, (baseUrl) =>
       request(baseUrl)
@@ -382,33 +423,118 @@ describe("agent routes adapter validation", () => {
         .send({
           name: "Codex Agent",
           adapterType: "codex_local",
-          adapterConfig: {},
+          adapterConfig,
         }),
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
     const createInput = mockAgentService.create.mock.calls.at(-1)?.[1] as Record<string, unknown>;
-    const adapterConfig = createInput.adapterConfig as Record<string, unknown>;
-    const env = (adapterConfig.env as Record<string, unknown> | undefined) ?? {};
-    expect(env.OPENAI_API_KEY).toBeUndefined();
-    expect(env.CODEX_HOME).toBeUndefined();
+    const persisted = createInput.adapterConfig as Record<string, unknown>;
+    const { CODEX_HOME: codexHome, ...otherEnv } = persisted.env as Record<string, unknown>;
+    expectPerAgentCodexHome(codexHome, String(createInput.id));
+    // No provider credential is invented or cleared; the home only isolates skills.
+    expect(otherEnv).toEqual(expectedCredentialEnv);
   });
 
-  it("does not re-inject CODEX_HOME or OPENAI_API_KEY when updating a keyless codex_local agent", async () => {
+  it("persists a per-agent CODEX_HOME beside a secret-bound OPENAI_API_KEY without touching the binding", async () => {
+    const keyBinding = { type: "secret_ref", secretId: "22222222-2222-4222-8222-222222222222", version: 2 };
     const app = await createApp();
     const res = await requestApp(app, (baseUrl) =>
       request(baseUrl)
-        .patch("/api/agents/11111111-1111-4111-8111-111111111111")
+        .post("/api/companies/company-1/agents")
         .send({
-          adapterConfig: { model: "gpt-5.4" },
+          name: "Secret Keyed Codex",
+          adapterType: "codex_local",
+          adapterConfig: { env: { OPENAI_API_KEY: keyBinding } },
         }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const createInput = mockAgentService.create.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const env = (createInput.adapterConfig as Record<string, unknown>).env as Record<string, unknown>;
+    expect(env.OPENAI_API_KEY).toEqual(keyBinding);
+    expectPerAgentCodexHome(env.CODEX_HOME, String(createInput.id));
+  });
+
+  it.each([
+    ["a plain binding", { type: "plain", value: "/srv/shared-codex" }],
+    ["a company secret", { type: "secret_ref", secretId: "33333333-3333-4333-8333-333333333333" }],
+    ["a user secret", { type: "user_secret_ref", key: "CODEX_HOME" }],
+  ])("keeps an explicit CODEX_HOME bound through %s on create", async (_label, homeBinding) => {
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .post("/api/companies/company-1/agents")
+        .send({
+          name: "Bound Home Codex",
+          adapterType: "codex_local",
+          adapterConfig: { env: { CODEX_HOME: homeBinding } },
+        }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    const createInput = mockAgentService.create.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const env = (createInput.adapterConfig as Record<string, unknown>).env as Record<string, unknown>;
+    expect(env).toEqual({ CODEX_HOME: homeBinding });
+  });
+
+  it("gives a keyless codex_local agent its per-agent CODEX_HOME on update and keeps unrelated config", async () => {
+    const agentId = "11111111-1111-4111-8111-111111111111";
+    const keyBinding = { type: "secret_ref", secretId: "22222222-2222-4222-8222-222222222222" };
+    const skillSync = { desiredSkills: ["paperclipai/paperclip/paperclip"] };
+    mockAgentService.getById.mockResolvedValue(storedCodexAgent({
+      model: "gpt-5.4",
+      cwd: "/work/project",
+      paperclipSkillSync: skillSync,
+      env: { FEATURE_FLAG: "on", OPENAI_API_KEY: keyBinding },
+    }));
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { model: "gpt-5.5" } }),
     );
 
     expect(res.status, JSON.stringify(res.body)).toBe(200);
     const patch = mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
     const adapterConfig = patch.adapterConfig as Record<string, unknown>;
-    const env = (adapterConfig.env as Record<string, unknown> | undefined) ?? {};
-    expect(env.OPENAI_API_KEY).toBeUndefined();
+    expect(adapterConfig).toMatchObject({ model: "gpt-5.5", cwd: "/work/project", paperclipSkillSync: skillSync });
+    const { CODEX_HOME: codexHome, ...otherEnv } = adapterConfig.env as Record<string, unknown>;
+    expect(otherEnv).toEqual({ FEATURE_FLAG: "on", OPENAI_API_KEY: keyBinding });
+    expectPerAgentCodexHome(codexHome, agentId);
+  });
+
+  it("keeps a stored external CODEX_HOME when updating a codex_local agent", async () => {
+    const agentId = "11111111-1111-4111-8111-111111111111";
+    mockAgentService.getById.mockResolvedValue(storedCodexAgent({ env: { CODEX_HOME: "/srv/shared-codex" } }));
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { model: "gpt-5.5" } }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const patch = mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    expect((patch.adapterConfig as Record<string, unknown>).env).toEqual({ CODEX_HOME: "/srv/shared-codex" });
+  });
+
+  it("adds no CODEX_HOME when updating a codex_local agent on a managed AI connection", async () => {
+    const agentId = "11111111-1111-4111-8111-111111111111";
+    mockAgentService.getById.mockResolvedValue(storedCodexAgent(
+      { model: "gpt-5.4" },
+      { aiConnection: { provider: "openai", method: "subscription", mode: "responsible_user" } },
+    ));
+    const app = await createApp();
+    const res = await requestApp(app, (baseUrl) =>
+      request(baseUrl)
+        .patch(`/api/agents/${agentId}`)
+        .send({ adapterConfig: { model: "gpt-5.5" } }),
+    );
+
+    expect(res.status, JSON.stringify(res.body)).toBe(200);
+    const patch = mockAgentService.update.mock.calls.at(-1)?.[1] as Record<string, unknown>;
+    const env = ((patch.adapterConfig as Record<string, unknown>).env as Record<string, unknown> | undefined) ?? {};
     expect(env.CODEX_HOME).toBeUndefined();
   });
 

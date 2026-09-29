@@ -72,7 +72,9 @@ import {
   evaluateCodexCredentialReadiness,
   isManagedCodexHomePath,
   pathExists,
+  prepareManagedAgentCodexHome,
   prepareManagedCodexHome,
+  resolveManagedAgentCodexHomeDir,
   resolveManagedCodexHomeDir,
   resolveSharedCodexHomeDir,
   seedManagedCodexHome,
@@ -639,14 +641,14 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       ? path.resolve(envConfig.CODEX_HOME.trim())
       : null;
   const connectorSourceHome = configuredCodexHome;
+  const companyCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
   const connectorSkillDigest = typeof config.paperclipConnectorSkillDigest === "string"
     && /^[a-f0-9]{64}$/.test(config.paperclipConnectorSkillDigest) ? config.paperclipConnectorSkillDigest : null;
   if (connectorSkillDigest) {
     // Never mount assignment-specific skills into the shared company/user home.
     // A different skill revision gets a new home, so revoked/changed resources
     // cannot survive as stale symlinks or bleed into another agent's session.
-    configuredCodexHome = path.join(resolveManagedCodexHomeDir(process.env, agent.companyId),
-      "connector-runtimes", agent.id, connectorSkillDigest);
+    configuredCodexHome = path.join(companyCodexHome, "connector-runtimes", agent.id, connectorSkillDigest);
   }
   const codexSkillEntries = (await readPaperclipRuntimeSkillEntries(config, __moduleDir))
     // A missing-source entry would become a dangling skill symlink; skip it.
@@ -693,21 +695,35 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       void error;
     });
   }
-  if (configuredCodexHome == null || (connectorSkillDigest && connectorSourceHome == null)) {
+  if (connectorSkillDigest && connectorSourceHome == null) {
     await prepareManagedCodexHome(process.env, onLog, agent.companyId, {
       apiKey: configuredOpenAiApiKey,
     });
   }
-  if (configuredHomeIsManaged && configuredCodexHome) {
+  // This agent's own per-agent home — the no-config default and the path the
+  // server persists for new agents — is seeded from the company home (the
+  // credential authority), never directly from the shared source, so a
+  // promoted company credential is not swapped for the host login. Skills and
+  // config.toml are mutable per run, so a home shared across agents would let
+  // one agent's skill reconciliation delete another running agent's skills.
+  // Connector, managed-connection, external, and other managed homes keep their
+  // own seeding below.
+  const usesOwnAgentHome = configuredCodexHome == null ||
+    (!connectorSkillDigest && !config.managedAiConnection &&
+      configuredCodexHome === resolveManagedAgentCodexHomeDir(process.env, agent.companyId, agent.id));
+  if (!usesOwnAgentHome && configuredHomeIsManaged && configuredCodexHome) {
     const seedEnv = connectorSkillDigest ? {
-      ...process.env, CODEX_HOME: connectorSourceHome ?? resolveManagedCodexHomeDir(process.env, agent.companyId),
+      ...process.env, CODEX_HOME: connectorSourceHome ?? companyCodexHome,
     } : process.env;
     await seedManagedCodexHome(configuredCodexHome, seedEnv, onLog, {
       apiKey: configuredOpenAiApiKey,
     });
   }
-  const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
-  const effectiveCodexHome = configuredCodexHome ?? defaultCodexHome;
+  const effectiveCodexHome = configuredCodexHome != null && !usesOwnAgentHome
+    ? configuredCodexHome
+    : await prepareManagedAgentCodexHome(process.env, onLog, agent.companyId, agent.id, {
+      apiKey: configuredOpenAiApiKey,
+    });
   await fs.mkdir(effectiveCodexHome, { recursive: true });
 
   // Never launch a managed CODEX_HOME with no credentials. Without auth.json
@@ -733,7 +749,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   // Merge custom model providers (PAPERCLIP_CODEX_PROVIDERS) into the managed
   // CODEX_HOME's config.toml BEFORE the home is shipped to a remote execution
   // target, so both local and sandboxed Codex processes pick up the routing.
-  // An explicit env.CODEX_HOME override is treated as user-managed and skipped.
+  // This agent's own managed home (default or persisted) gets the merge; any
+  // other explicit env.CODEX_HOME override is treated as user-managed and skipped.
   const envConfigStrings = Object.fromEntries(
     Object.entries(envConfig).filter(
       (entry): entry is [string, string] => typeof entry[1] === "string",
@@ -741,7 +758,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   );
   const preparedRuntimeConfig = await prepareCodexRuntimeConfig({
     env: envConfigStrings,
-    codexHome: configuredCodexHome ? null : effectiveCodexHome,
+    codexHome: usesOwnAgentHome ? effectiveCodexHome : null,
   });
   // Curated allowlist dir staged for the remote `home` asset (see below). Held
   // here so the outer `finally` can remove it on every exit path (teardown and

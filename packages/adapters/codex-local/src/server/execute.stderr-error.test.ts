@@ -62,6 +62,7 @@ vi.mock("./codex-home.js", async () => {
       sharedSourceHome: tempCodexHome,
     })),
     isManagedCodexHomePath: vi.fn(() => true),
+    prepareManagedAgentCodexHome: vi.fn(async () => tempCodexHome),
     prepareManagedCodexHome: vi.fn(async () => ({ status: "seeded", home: tempCodexHome })),
     resolveManagedCodexHomeDir: vi.fn(() => tempCodexHome),
     seedManagedCodexHome: vi.fn(async () => ({ status: "seeded", home: tempCodexHome })),

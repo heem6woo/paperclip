@@ -2481,29 +2481,32 @@ export function agentRoutes(
     return path.resolve(instanceRoot, "companies", companyId, "agents", agentId, "codex-home");
   }
 
-  function codexLocalEnvKeyConfigured(value: unknown): boolean {
+  function codexLocalHomeConfigured(value: unknown): boolean {
     if (asEnvBindingString(value)) return true;
     const record = asRecord(value);
-    return record?.type === "secret_ref" && typeof record.secretId === "string";
+    return record?.type === "secret_ref" || record?.type === "user_secret_ref";
   }
 
-  // codex_local agents inherit whatever Codex login is already on the device
-  // (the host's ~/.codex or $CODEX_HOME) by default, so a fresh agent needs no
-  // env overrides at all. We only carve out an isolated per-agent CODEX_HOME
-  // when the agent sets its own OPENAI_API_KEY, so that key's api-key auth.json
-  // does not collide with the shared company home other agents use for the host
-  // login. Agents without a key share the host credentials.
-  function applyCodexLocalKeyIsolation(
+  // Codex reconciles each agent's desired skills into CODEX_HOME/skills and
+  // prunes entries the agent does not want, so agents that share one mutable
+  // Codex home remove each other's skills mid-run. Every codex_local agent
+  // without an explicit home therefore persists its own per-agent managed
+  // CODEX_HOME. The adapter seeds that home from the existing company credential
+  // authority (or writes the agent's own OPENAI_API_KEY auth), so credential identity and
+  // inheritance stay as configured. An explicit or secret-bound CODEX_HOME is
+  // kept. A managed AI connection supplies its own per-run provider home and
+  // treats CODEX_HOME as a credential override, so it gets none.
+  function applyCodexLocalAgentHome(
     companyId: string,
     agentId: string,
     adapterType: string | null | undefined,
     adapterConfig: Record<string, unknown>,
+    aiConnection: unknown,
   ): Record<string, unknown> {
     if (adapterType !== "codex_local") return adapterConfig;
-    const existingEnv = asRecord(adapterConfig.env);
-    if (!existingEnv) return adapterConfig;
-    if (!codexLocalEnvKeyConfigured(existingEnv.OPENAI_API_KEY)) return adapterConfig;
-    if (codexLocalEnvKeyConfigured(existingEnv.CODEX_HOME)) return adapterConfig;
+    if (aiConnectionBindingSchema.safeParse(aiConnection).success) return adapterConfig;
+    const existingEnv = asRecord(adapterConfig.env) ?? {};
+    if (codexLocalHomeConfigured(existingEnv.CODEX_HOME)) return adapterConfig;
     return {
       ...adapterConfig,
       env: { ...existingEnv, CODEX_HOME: codexLocalAgentHome(companyId, agentId) },
@@ -4432,11 +4435,21 @@ export function agentRoutes(
       ),
       hireInput.runtimeConfig,
     );
-    const requestedAdapterConfig = applyCodexLocalKeyIsolation(
+    // The runtime config decides whether a managed AI connection supplies the
+    // Codex home, so resolve it before the per-agent home is applied.
+    const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(
+      req,
+      companyId,
+      hireInput.adapterType,
+      authInheritance.adapterConfig,
+      hireInput.runtimeConfig,
+    );
+    const requestedAdapterConfig = applyCodexLocalAgentHome(
       companyId,
       hiredAgentId,
       hireInput.adapterType,
       authInheritance.adapterConfig,
+      normalizedRuntimeConfig.aiConnection,
     );
     assertExternalInstructionsAdmin(req, {
       id: hiredAgentId,
@@ -4463,7 +4476,6 @@ export function agentRoutes(
       adapterType: hireInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
-    const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, hireInput.adapterType, normalizedAdapterConfig, hireInput.runtimeConfig);
     const normalizedHireInput = {
       ...hireInput,
       adapterConfig: normalizedAdapterConfig,
@@ -4724,14 +4736,25 @@ export function agentRoutes(
     );
     assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
     const agentId = randomUUID();
-    const requestedAdapterConfig = applyCodexLocalKeyIsolation(
+    const createDefaultsAdapterConfig = applyCreateDefaultsByAdapterType(
+      createInput.adapterType,
+      rawCreateAdapterConfig,
+    );
+    // The runtime config decides whether a managed AI connection supplies the
+    // Codex home, so resolve it before the per-agent home is applied.
+    const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(
+      req,
+      companyId,
+      createInput.adapterType,
+      createDefaultsAdapterConfig,
+      createInput.runtimeConfig,
+    );
+    const requestedAdapterConfig = applyCodexLocalAgentHome(
       companyId,
       agentId,
       createInput.adapterType,
-      applyCreateDefaultsByAdapterType(
-        createInput.adapterType,
-        rawCreateAdapterConfig,
-      ),
+      createDefaultsAdapterConfig,
+      normalizedRuntimeConfig.aiConnection,
     );
     assertExternalInstructionsAdmin(req, {
       id: agentId,
@@ -4758,7 +4781,6 @@ export function agentRoutes(
       adapterType: createInput.adapterType,
       adapterConfig: desiredSkillAssignment.adapterConfig,
     });
-    const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, createInput.adapterType, normalizedAdapterConfig, createInput.runtimeConfig);
     await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
     await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
       allowedDrivers: allowedEnvironmentDriversForAgent(createInput.adapterType),
@@ -5263,7 +5285,7 @@ export function agentRoutes(
           rawEffectiveAdapterConfig,
         );
       }
-      const effectiveAdapterConfig = applyCodexLocalKeyIsolation(
+      const effectiveAdapterConfig = applyCodexLocalAgentHome(
         existing.companyId,
         existing.id,
         requestedAdapterType,
@@ -5271,6 +5293,8 @@ export function agentRoutes(
           requestedAdapterType,
           rawEffectiveAdapterConfig,
         ),
+        // A PATCH never clears a stored AI connection; see the binding merge below.
+        requestedRuntimeConfig?.aiConnection || existing.runtimeConfig.aiConnection,
       );
       const normalizedEffectiveAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
         companyId: existing.companyId,

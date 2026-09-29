@@ -793,6 +793,14 @@ function resolveManagedCodexHomeDir(companyId: string): string {
   return path.join(defaultPaperclipInstanceDir(), "companies", companyId, "codex-home");
 }
 
+// Mirrors `resolveManagedAgentCodexHomeDir` in the Codex adapter's
+// `codex-home.ts` and the server isolation guard: the per-agent home that holds
+// an agent's mutable Codex state, so two agents in one company never reconcile
+// each other's skill directories.
+function resolveManagedAgentCodexHomeDir(companyId: string, agentId: string): string {
+  return path.join(defaultPaperclipInstanceDir(), "companies", companyId, "agents", agentId, "codex-home");
+}
+
 // Mirrors `resolveManagedGrokHomeDir` in
 // `packages/adapters/grok-local/src/server/grok-home.ts` — this package
 // cannot import that adapter package (it would invert the dependency
@@ -983,6 +991,50 @@ async function ensureCopiedFile(target: string, source: string): Promise<void> {
   await fs.copyFile(source, target);
 }
 
+// The usable subscription identity in a Codex `auth.json`, or null for an
+// absent, unusable, or API-key credential. Mirrors `readSubscriptionAccountId`
+// and `readAuthLastRefreshMs` in the Codex adapter (this package cannot import
+// it); keep them in step when the auth format changes.
+function readCodexSubscriptionAuth(bytes: Buffer | null): { accountId: string; lastRefreshMs: number | null } | null {
+  if (!bytes) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(bytes.toString("utf8"));
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+  const fields = parsed as Record<string, unknown>;
+  const apiKey = fields.OPENAI_API_KEY;
+  if (typeof apiKey === "string" && apiKey.trim().length > 0) return null;
+  const tokens = fields.tokens;
+  if (tokens === null || typeof tokens !== "object" || Array.isArray(tokens)) return null;
+  const tokenFields = tokens as Record<string, unknown>;
+  const accountId = tokenFields.account_id;
+  const hasTokenMaterial = asString(tokenFields.id_token, "").trim()
+    || asString(tokenFields.access_token, "").trim()
+    || asString(tokenFields.refresh_token, "").trim();
+  if (typeof accountId !== "string" || accountId.trim().length === 0 || !hasTokenMaterial) return null;
+  const lastRefresh = fields.last_refresh;
+  const lastRefreshMs = typeof lastRefresh === "string" ? Date.parse(lastRefresh) : NaN;
+  return { accountId, lastRefreshMs: Number.isFinite(lastRefreshMs) ? lastRefreshMs : null };
+}
+
+// Same keep rule as the Codex adapter's `seedManagedCodexHome`: a regular-file
+// subscription `auth.json` (a promoted device-login credential) stays
+// authoritative unless the source holds the same identity with a strictly newer
+// `last_refresh`. Ties, unparseable freshness, and unreadable sources keep it —
+// removing a promoted credential is irreversible, keeping it self-corrects.
+async function keepsPromotedCodexAuth(targetAuth: string, sourceAuth: string): Promise<boolean> {
+  const existing = await fs.lstat(targetAuth).catch(() => null);
+  if (!existing?.isFile()) return false;
+  const target = readCodexSubscriptionAuth(await fs.readFile(targetAuth).catch(() => null));
+  if (!target) return false;
+  const source = readCodexSubscriptionAuth(await fs.readFile(sourceAuth).catch(() => null));
+  if (!source || source.accountId !== target.accountId) return true;
+  return !(source.lastRefreshMs !== null && target.lastRefreshMs !== null && source.lastRefreshMs > target.lastRefreshMs);
+}
+
 async function prepareManagedCodexHome(input: {
   companyId: string;
   sourceHome: string;
@@ -995,7 +1047,12 @@ async function prepareManagedCodexHome(input: {
   await fs.mkdir(targetHome, { recursive: true });
 
   const authJson = path.join(sourceHome, "auth.json");
-  if (await pathExists(authJson)) await ensureSymlink(path.join(targetHome, "auth.json"), authJson);
+  const targetAuth = path.join(targetHome, "auth.json");
+  if (await keepsPromotedCodexAuth(targetAuth, authJson)) {
+    await onLog("stdout", `[paperclip] Keeping the promoted subscription auth.json in ACPX Codex home "${targetHome}".\n`);
+  } else if (await pathExists(authJson)) {
+    await ensureSymlink(targetAuth, authJson);
+  }
 
   for (const name of ["config.json", "config.toml", "instructions.md"]) {
     const source = path.join(sourceHome, name);
@@ -1240,6 +1297,7 @@ async function reconcileManagedCodexSkills(input: {
 
 async function prepareCodexSkillRuntime(input: {
   companyId: string;
+  agentId: string;
   config: Record<string, unknown>;
   env: Record<string, string>;
   moduleDir: string;
@@ -1267,14 +1325,36 @@ async function prepareCodexSkillRuntime(input: {
     typeof process.env.CODEX_HOME === "string" && process.env.CODEX_HOME.trim().length > 0
       ? path.resolve(process.env.CODEX_HOME.trim())
       : path.join(os.homedir(), ".codex");
-  const managedCodexHome = resolveManagedCodexHomeDir(input.companyId);
-  const effectiveCodexHome = configuredCodexHome ??
+  const companyCodexHome = resolveManagedCodexHomeDir(input.companyId);
+  const agentCodexHome = resolveManagedAgentCodexHomeDir(input.companyId, input.agentId);
+  const configuredApiKey = envConfig.OPENAI_API_KEY != null &&
+    !(typeof envConfig.OPENAI_API_KEY === "string" && envConfig.OPENAI_API_KEY.trim().length === 0);
+  // Skills are reconciled against a per-home manifest, so a home shared by two
+  // agents lets one agent's run delete the other's skills mid-session. With no
+  // configured CODEX_HOME the agent therefore runs in its own home. The company
+  // home stays the credential authority: it is prepared exactly as before (a
+  // promoted company credential is kept), and the agent home links its
+  // auth.json. An explicit CODEX_HOME that names this same per-agent home (the
+  // server's persisted default) gets the same seeding unless an API key or a
+  // managed AI connection supplies the credential; any other explicit home is
+  // user-managed and left untouched.
+  const seedsAgentHome = configuredCodexHome == null ||
+    (configuredCodexHome === path.resolve(agentCodexHome) && !configuredApiKey && !input.config.managedAiConnection);
+  if (seedsAgentHome) {
     await prepareManagedCodexHome({
       companyId: input.companyId,
       sourceHome: sourceCodexHome,
-      targetHome: managedCodexHome,
+      targetHome: companyCodexHome,
       onLog: input.onLog,
     });
+    await prepareManagedCodexHome({
+      companyId: input.companyId,
+      sourceHome: companyCodexHome,
+      targetHome: agentCodexHome,
+      onLog: input.onLog,
+    });
+  }
+  const effectiveCodexHome = configuredCodexHome ?? agentCodexHome;
   const { allSkills, selectedSkills, desiredSkillNames } = await resolveSelectedRuntimeSkills(input.config, input.moduleDir);
   const skillSetKey = await buildSkillSetKey({ skills: selectedSkills, label: "codex" });
   const skillsHome = path.join(effectiveCodexHome, "skills");
@@ -2031,6 +2111,7 @@ async function buildRuntime(input: {
     const preparedSkills = await measureStartupStep(input.ctx, nowMs, "codex-home.seed", () =>
       prepareCodexSkillRuntime({
         companyId: agent.companyId,
+        agentId: agent.id,
         config,
         env,
         moduleDir: input.engine.moduleDir,

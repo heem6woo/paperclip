@@ -349,7 +349,7 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
   }
 
   async function seedIssueWithAdapterRunComment(input: {
-    adapterType: "claude_local" | "opencode_local";
+    adapterType: "claude_local" | "opencode_local" | "codex_local";
     sessionId: string;
   }) {
     const companyId = randomUUID();
@@ -396,8 +396,12 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
       startedAt: new Date("2026-04-01T10:00:00.000Z"),
       finishedAt: new Date("2026-04-01T10:05:00.000Z"),
       usageJson: {
-        provider: input.adapterType === "claude_local" ? "anthropic" : "opencode",
-        model: input.adapterType === "claude_local" ? "claude-opus-4-6" : "opencode/minimax-m2.5-free",
+        provider: input.adapterType === "codex_local"
+          ? "openai"
+          : input.adapterType === "claude_local" ? "anthropic" : "opencode",
+        model: input.adapterType === "codex_local"
+          ? "gpt-5.4"
+          : input.adapterType === "claude_local" ? "claude-opus-4-6" : "opencode/minimax-m2.5-free",
       },
     });
 
@@ -410,7 +414,7 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
       body: "Trace-backed agent output",
     });
 
-    return { companyId, issueId, commentId };
+    return { companyId, agentId, issueId, commentId };
   }
 
   it("stores a local vote without enabling sharing by default", async () => {
@@ -719,6 +723,48 @@ describeEmbeddedPostgres("feedbackService.saveIssueVote", () => {
     expect(sharedTrace?.status).toBe("pending");
     expect(sharedTrace?.exportId).toMatch(/^fbexp_/);
     expect(sharedTrace?.payloadVersion).toBe("paperclip-feedback-v1");
+  });
+
+  it("captures the agent-owned Codex session before a legacy company copy", async () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "paperclip-feedback-codex-"));
+    tempDirs.push(home);
+    vi.stubEnv("PAPERCLIP_HOME", home);
+    vi.stubEnv("PAPERCLIP_INSTANCE_ID", "feedback-codex");
+    vi.stubEnv("PAPERCLIP_CONFIG", path.join(home, "instances", "feedback-codex", "config.json"));
+    const sessionId = randomUUID();
+    const { companyId, agentId, issueId, commentId } = await seedIssueWithAdapterRunComment({
+      adapterType: "codex_local",
+      sessionId,
+    });
+    const companyRoot = path.join(home, "instances", "feedback-codex", "companies", companyId);
+    const agentSessions = path.join(companyRoot, "agents", agentId, "codex-home", "sessions");
+    const legacySessions = path.join(companyRoot, "codex-home", "sessions");
+    for (const [directory, message] of [
+      [agentSessions, "agent-owned-current-evidence"],
+      [legacySessions, "obsolete-company-evidence"],
+    ]) {
+      fs.mkdirSync(directory!, { recursive: true });
+      fs.writeFileSync(
+        path.join(directory!, `${sessionId}.jsonl`),
+        `${JSON.stringify({ type: "event_msg", payload: { type: "agent_message", message } })}\n`,
+      );
+    }
+    const uploadTraceBundle = vi.fn().mockResolvedValue({ objectKey: "feedback-traces/test.json" });
+    const flushingSvc = feedbackService(db, { shareClient: { uploadTraceBundle } });
+    await flushingSvc.saveIssueVote({
+      issueId,
+      targetType: "issue_comment",
+      targetId: commentId,
+      vote: "up",
+      authorUserId: "user-1",
+      allowSharing: true,
+    });
+    await flushingSvc.flushPendingFeedbackTraces();
+    const bundle = uploadTraceBundle.mock.calls[0]?.[0] as Record<string, unknown> | undefined;
+    const files = Array.isArray(bundle?.files) ? bundle.files as Array<Record<string, unknown>> : [];
+    const session = files.find((file) => file.path === "adapter/codex/session.jsonl");
+    expect(session?.contents).toContain("agent-owned-current-evidence");
+    expect(session?.contents).not.toContain("obsolete-company-evidence");
   });
 
   it("captures Claude project session artifacts as full traces", async () => {

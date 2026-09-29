@@ -9,6 +9,7 @@ import {
   evaluateCodexCredentialReadiness,
   mergeManagedCodexMcpGateways,
   isManagedCodexHomePath,
+  prepareManagedAgentCodexHome,
   prepareManagedCodexHome,
   reconcileManagedCodexHome,
   seedManagedCodexHome,
@@ -678,6 +679,105 @@ describe("seedManagedCodexHome", () => {
       const healed = path.join(companyHome, "auth.json");
       expect((await fs.lstat(healed)).isSymbolicLink()).toBe(true);
       expect(await fs.readFile(healed, "utf8")).toBe(shared);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("prepareManagedAgentCodexHome", () => {
+  it("gives each agent its own home linked to the company credential without re-deciding identity", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-agent-home-"));
+    try {
+      const sharedCodexHome = path.join(root, "shared-codex-home");
+      const paperclipHome = path.join(root, "paperclip-home");
+      const companyRoot = path.join(paperclipHome, "instances", "default", "companies", "company-1");
+      const companyHome = path.join(companyRoot, "codex-home");
+      const env: NodeJS.ProcessEnv = {
+        CODEX_HOME: sharedCodexHome,
+        PAPERCLIP_HOME: paperclipHome,
+        PAPERCLIP_INSTANCE_ID: "default",
+      };
+      const subscription = (accountId: string) => JSON.stringify({
+        tokens: { access_token: `synthetic-${accountId}`, refresh_token: `synthetic-${accountId}`, account_id: accountId },
+        last_refresh: "2026-07-09T00:00:00Z",
+      });
+      // The company holds a promoted device-login credential for a different
+      // account than the host login; it is the authority for keyless agents.
+      const promoted = subscription("acct-company");
+      await fs.mkdir(sharedCodexHome, { recursive: true });
+      await fs.writeFile(path.join(sharedCodexHome, "auth.json"), subscription("acct-host"), "utf8");
+      await fs.mkdir(companyHome, { recursive: true });
+      await fs.writeFile(path.join(companyHome, "auth.json"), promoted, "utf8");
+
+      const keylessHome = await prepareManagedAgentCodexHome(env, async () => {}, "company-1", "agent-a");
+      const keyedHome = await prepareManagedAgentCodexHome(env, async () => {}, "company-1", "agent-b", {
+        apiKey: "sk-agent-b",
+      });
+
+      expect(keylessHome).toBe(path.join(companyRoot, "agents", "agent-a", "codex-home"));
+      expect(keyedHome).toBe(path.join(companyRoot, "agents", "agent-b", "codex-home"));
+      expect(await fs.readlink(path.join(keylessHome, "auth.json"))).toBe(path.join(companyHome, "auth.json"));
+      expect(await fs.readFile(path.join(keylessHome, "auth.json"), "utf8")).toBe(promoted);
+      expect(JSON.parse(await fs.readFile(path.join(keyedHome, "auth.json"), "utf8"))).toEqual({
+        OPENAI_API_KEY: "sk-agent-b",
+      });
+      // The company credential is neither swapped for the host login nor
+      // overwritten by one agent's API key.
+      expect((await fs.lstat(path.join(companyHome, "auth.json"))).isSymbolicLink()).toBe(false);
+      expect(await fs.readFile(path.join(companyHome, "auth.json"), "utf8")).toBe(promoted);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps a persisted per-agent home on the promoted company credential through startup reconcile and readiness", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-agent-home-reconcile-"));
+    try {
+      const sharedCodexHome = path.join(root, "shared-codex-home");
+      const paperclipHome = path.join(root, "paperclip-home");
+      const companyRoot = path.join(paperclipHome, "instances", "default", "companies", "company-1");
+      const companyHome = path.join(companyRoot, "codex-home");
+      const agentHome = path.join(companyRoot, "agents", "agent-a", "codex-home");
+      const env: NodeJS.ProcessEnv = {
+        CODEX_HOME: sharedCodexHome,
+        PAPERCLIP_HOME: paperclipHome,
+        PAPERCLIP_INSTANCE_ID: "default",
+      };
+      const promoted = JSON.stringify({
+        tokens: { access_token: "synthetic-company", refresh_token: "synthetic-company", account_id: "acct-company" },
+        last_refresh: "2026-07-09T00:00:00Z",
+      });
+      // No host login at all: only the promoted company credential exists.
+      await fs.mkdir(sharedCodexHome, { recursive: true });
+      await fs.mkdir(companyHome, { recursive: true });
+      await fs.writeFile(path.join(companyHome, "auth.json"), promoted, "utf8");
+
+      const readiness = await evaluateCodexCredentialReadiness({
+        env,
+        companyId: "company-1",
+        configuredCodexHome: agentHome,
+        configuredApiKey: null,
+      });
+      expect(readiness.ready).toBe(true);
+
+      const result = await reconcileManagedCodexHome({ env, companyId: "company-1", configuredCodexHome: agentHome });
+      expect(result).toEqual({ status: "seeded", home: agentHome });
+      expect(await fs.readlink(path.join(agentHome, "auth.json"))).toBe(path.join(companyHome, "auth.json"));
+      expect(await fs.readFile(path.join(agentHome, "auth.json"), "utf8")).toBe(promoted);
+    } finally {
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects an agent id that would escape the company agents directory before touching any home", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-agent-home-unsafe-"));
+    try {
+      const env: NodeJS.ProcessEnv = { CODEX_HOME: path.join(root, "shared"), PAPERCLIP_HOME: root };
+      await expect(prepareManagedAgentCodexHome(env, async () => {}, "company-1", "..")).rejects.toThrow(
+        "safe path segment",
+      );
+      await expect(fs.lstat(path.join(root, "instances"))).rejects.toThrow();
     } finally {
       await fs.rm(root, { recursive: true, force: true });
     }
