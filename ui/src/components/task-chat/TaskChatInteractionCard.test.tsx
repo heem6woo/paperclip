@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { IssueDocument } from "@paperclipai/shared";
 import type {
   IssueThreadInteraction,
+  RequestCheckboxConfirmationInteraction,
   RequestConfirmationInteraction,
 } from "@/lib/issue-thread-interactions";
 import { ThemeProvider } from "@/context/ThemeContext";
@@ -16,8 +17,12 @@ import {
   pendingAskUserQuestionsInteraction,
   pendingRequestCheckboxConfirmationInteraction,
   pendingRequestItemVerdictsInteraction,
+  pendingSuggestedTasksInteraction,
 } from "@/fixtures/issueThreadInteractionFixtures";
-import { TaskChatInteractionCard } from "./TaskChatInteractionCard";
+import {
+  TaskChatInteractionCard,
+  type TaskChatInteractionCardProps,
+} from "./TaskChatInteractionCard";
 import { TaskChatThreadView } from "./TaskChatThreadView";
 import type { TaskChatInteractionItem } from "./task-chat-model";
 
@@ -845,6 +850,161 @@ describe("TaskChatInteractionCard", () => {
     expect(container.textContent).toContain(
       "I want to write a normal message.",
     );
+  });
+});
+
+describe("TaskChatInteractionCard takeover drafts", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+
+  beforeEach(() => {
+    localStorage.clear();
+    container = document.createElement("div");
+    document.body.appendChild(container);
+    root = createRoot(container);
+  });
+
+  afterEach(() => {
+    flushSync(() => root.unmount());
+    container.remove();
+    localStorage.clear();
+  });
+
+  const draftKeyFor = (interactionId: string) =>
+    `paperclip:task-input:issue-1:interaction:${interactionId}`;
+
+  function checkboxInteraction(
+    id: string,
+    optionIds: string[],
+    defaultSelectedOptionIds: string[],
+  ): RequestCheckboxConfirmationInteraction {
+    const interaction = structuredClone(
+      pendingRequestCheckboxConfirmationInteraction,
+    );
+    interaction.id = id;
+    interaction.payload = {
+      ...interaction.payload,
+      options: optionIds.map((optionId) => ({
+        id: optionId,
+        label: `Option ${optionId}`,
+      })),
+      defaultSelectedOptionIds,
+      acceptLabel: "Confirm choice",
+    };
+    return interaction;
+  }
+
+  async function renderTakeover(
+    interaction: IssueThreadInteraction,
+    handlers: Pick<
+      TaskChatInteractionCardProps,
+      "onAcceptInteraction" | "onRejectInteraction"
+    > = {},
+  ) {
+    await act(async () => {
+      root.render(
+        <TooltipProvider>
+          <ThemeProvider>
+            <TaskChatInteractionCard
+              item={interactionItem(interaction)}
+              presentation="takeover"
+              draftKey={draftKeyFor(interaction.id)}
+              {...handlers}
+            />
+          </ThemeProvider>
+        </TooltipProvider>,
+      );
+    });
+  }
+
+  function checkedOptionLabels() {
+    return Array.from(
+      container.querySelectorAll('[role="checkbox"][aria-checked="true"]'),
+    ).map((checkbox) => checkbox.closest("label")?.textContent?.trim());
+  }
+
+  function button(label: string) {
+    const match = Array.from(
+      container.querySelectorAll<HTMLButtonElement>("button"),
+    ).find((candidate) => candidate.textContent?.trim() === label);
+    if (!match) throw new Error(`Missing button ${label}`);
+    return match;
+  }
+
+  it("starts the next checkbox interaction from its own defaults, not the previous selection", async () => {
+    const accept = vi.fn().mockResolvedValue(undefined);
+    const first = checkboxInteraction("checkbox-a", ["shared", "a-only"], []);
+    await renderTakeover(first, { onAcceptInteraction: accept });
+    for (const label of ["Option shared", "Option a-only"]) {
+      const checkbox = Array.from(
+        container.querySelectorAll<HTMLButtonElement>('[role="checkbox"]'),
+      ).find((candidate) => candidate.closest("label")?.textContent === label);
+      await act(async () => checkbox?.click());
+    }
+    expect(checkedOptionLabels()).toEqual(["Option shared", "Option a-only"]);
+
+    // The takeover slot is reused in place when the next interaction arrives.
+    const next = checkboxInteraction(
+      "checkbox-b",
+      ["shared", "b-only"],
+      ["b-only", "not-offered"],
+    );
+    await renderTakeover(next, { onAcceptInteraction: accept });
+
+    expect(checkedOptionLabels()).toEqual(["Option b-only"]);
+    expect(
+      JSON.parse(localStorage.getItem(draftKeyFor("checkbox-b")) ?? "null"),
+    ).toEqual({ selected: ["b-only"], reason: "" });
+    expect(
+      JSON.parse(localStorage.getItem(draftKeyFor("checkbox-a")) ?? "null"),
+    ).toEqual({ selected: ["shared", "a-only"], reason: "" });
+
+    await act(async () => button("Confirm choice").click());
+    expect(accept).toHaveBeenCalledOnce();
+    expect(accept.mock.calls[0]?.[0]?.id).toBe("checkbox-b");
+    expect(accept.mock.calls[0]?.[2]).toEqual(["b-only"]);
+    expect(localStorage.getItem(draftKeyFor("checkbox-b"))).toBeNull();
+  });
+
+  it("keeps valid saved checkbox choices and drops IDs the interaction does not offer", async () => {
+    const accept = vi.fn().mockResolvedValue(undefined);
+    const interaction = checkboxInteraction(
+      "checkbox-b",
+      ["shared", "b-only"],
+      ["shared"],
+    );
+    localStorage.setItem(
+      draftKeyFor(interaction.id),
+      JSON.stringify({ selected: ["a-only", "b-only"], reason: "saved note" }),
+    );
+
+    await renderTakeover(interaction, { onAcceptInteraction: accept });
+
+    expect(checkedOptionLabels()).toEqual(["Option b-only"]);
+    expect(
+      JSON.parse(localStorage.getItem(draftKeyFor(interaction.id)) ?? "null"),
+    ).toEqual({ selected: ["b-only"], reason: "saved note" });
+    await act(async () => button("Confirm choice").click());
+    expect(accept.mock.calls[0]?.[2]).toEqual(["b-only"]);
+  });
+
+  it("drops saved suggested-task keys that are not in the current suggestion", async () => {
+    const accept = vi.fn().mockResolvedValue(undefined);
+    localStorage.setItem(
+      draftKeyFor(pendingSuggestedTasksInteraction.id),
+      JSON.stringify({
+        selected: ["root-design", "task-from-older-suggestion"],
+        reason: "",
+      }),
+    );
+
+    await renderTakeover(pendingSuggestedTasksInteraction, {
+      onAcceptInteraction: accept,
+    });
+
+    expect(container.textContent).toContain("1 of 4 selected");
+    await act(async () => button("Create selected").click());
+    expect(accept.mock.calls[0]?.[1]).toEqual(["root-design"]);
   });
 });
 

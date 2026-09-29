@@ -5,6 +5,8 @@
 ### Patch Changes
 
 - Bound full-tree workspace Git scans with process-wide concurrency, queue, timeout, cancellation, coalescing, and short-lived changed-file caching. Saturated or timed-out changed-file requests now return a retryable degraded response, and hidden file-browser panels no longer initiate scans.
+- Start the new assignee's parked task wake once a run stopped for reassignment finishes cleaning up its environment lease, including after a restart and when the new assignee never ran before. Operator Stops, later Stops of the new assignee, and done or cancelled tasks still keep queued work parked; the former owner's queued work is never relaunched.
+- Isolate task approval drafts by interaction identity and discard saved checkbox IDs that are not offered by the current card, preventing stale supplier selections from causing validation errors after switching cards or refreshing.
 
 ## 0.3.1
 

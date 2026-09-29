@@ -2569,6 +2569,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
   const takeoverContent = selectedPendingInput ? (
     selectedPendingInput.kind === "runtime" ? (
       <TaskChatProtocolCard
+        key={selectedPendingInput.key}
         item={selectedPendingInput.item}
         presentation="takeover"
         draftKey={interactionDraftKey}
@@ -2578,6 +2579,7 @@ export function TaskChatThread(props: TaskChatThreadProps) {
       />
     ) : (
       <TaskChatInteractionCard
+        key={selectedPendingInput.key}
         item={{
           id: `interaction:${selectedPendingInput.interaction.id}`,
           kind: "interaction",

@@ -1091,6 +1091,23 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
               sql`${agentWakeupRequests.payload}->>'issueId' = ${issueRow.id}`,
             )).limit(1)
           : [];
+        const executionCancellationAcknowledged =
+          run.status === "cancelled" &&
+          (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
+          !interruptedQueue;
+        // A reassignment Stop is acknowledged like an operator Stop, but its
+        // purpose is to hand the open task to the new assignee. Only the newest
+        // run on the task qualifies, so a later receiver Stop keeps its hold.
+        const [newerIssueRun] = executionCancellationAcknowledged && issueRow &&
+            run.errorCode === "issue_reassigned" && issueRow.assigneeAgentId &&
+            issueRow.assigneeAgentId !== run.agentId && !["done", "cancelled"].includes(issueRow.status)
+          ? await tx.select({ id: heartbeatRuns.id }).from(heartbeatRuns).where(and(
+              eq(heartbeatRuns.companyId, input.companyId),
+              sql`coalesce(${heartbeatRuns.nativeIssueId}::text, ${heartbeatRuns.contextSnapshot}->>'issueId') = ${issueRow.id}`,
+              sql`(${heartbeatRuns.createdAt}, ${heartbeatRuns.id}) > (select source.created_at, source.id from heartbeat_runs source where source.id = ${run.id})`,
+            )).limit(1)
+          : [{ id: run.id }];
+        const assigneeHandoffOnly = !newerIssueRun;
         const preDrainFacts: PreDrainFacts = {
           issueRowPresent: issueRow !== null,
           executionRunIdMatchesRun: !issueRow || !issueRow.executionRunId || issueRow.executionRunId === run.id,
@@ -1103,10 +1120,7 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           // An operator stop never promotes old queued work by itself. The
           // next explicit wake adopts those messages atomically when it
           // queues a run.
-          executionCancellationAcknowledged:
-            run.status === "cancelled" &&
-            (parseObject(run.resultJson?.executionCancellation).state === "acknowledged" || isAcknowledgedNativeStop(run)) &&
-            !interruptedQueue,
+          executionCancellationAcknowledged: executionCancellationAcknowledged && !assigneeHandoffOnly,
         };
         const preDrain = decidePreDrain(preDrainFacts);
 
@@ -1188,7 +1202,9 @@ export function createPostgresWakeQueueAdapter(db: Db, deps: WakeQueuePostgresAd
           return { outcome: { kind: "released" }, postCommitEffects: [], run: runSnapshot };
         }
 
-        const locked: LockedIssueExecution = { primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly };
+        const locked: LockedIssueExecution = {
+          primaryIssue: toIssueSnapshot(issueRow), run: runSnapshot, recoveryOnly, assigneeHandoffOnly,
+        };
         const result = await fn(locked, { host: buildHost(tx, deps), transaction: buildTransaction(tx, deps, db, run) });
         return { ...result, run: runSnapshot };
       });

@@ -9,6 +9,7 @@ import {
   agents,
   companies,
   createDb,
+  environmentLeases,
   heartbeatRuns,
   issueComments,
   issueRecoveryActions,
@@ -723,6 +724,102 @@ describeEmbeddedPostgres("wake-queue postgres adapter", () => {
     // executionRunId already pointed at the retry, not the finishing run, so it must survive.
     expect(issueRow?.executionRunId).toBe(retryRunId);
     expect(issueRow?.checkoutRunId).toBeNull();
+  });
+
+  describe("reassignment Stop handoff", () => {
+    async function seedHandoff(input: { sourceErrorCode?: string; issueStatus?: string } = {}) {
+      const companyId = await seedCompany();
+      const sourceAgentId = await seedAgent({ companyId, name: "Source" });
+      const receiverAgentId = await seedAgent({ companyId, name: "Receiver" });
+      const issueId = await seedIssue({ companyId, assigneeAgentId: receiverAgentId, status: input.issueStatus ?? "todo" });
+      const sourceRunId = await seedRun({ companyId, agentId: sourceAgentId, status: "cancelled",
+        errorCode: input.sourceErrorCode ?? "issue_reassigned", contextSnapshot: { issueId } });
+      // The executor acknowledged the provider stop, then still holds its
+      // environment lease until its own cleanup finishes.
+      await db.update(heartbeatRuns).set({
+        runtimeMode: "legacy",
+        createdAt: new Date(Date.now() - 60_000),
+        runnerProfileJson: { adapterDispatch: { adapterType: "codex_local" } },
+        resultJson: {
+          executionCancellation: { state: "acknowledged" },
+          conversationContinuation: "continue_conversation_v1",
+          reassignmentStopConfirmed: true,
+        },
+      }).where(eq(heartbeatRuns.id, sourceRunId));
+      const [lease] = await db.insert(environmentLeases).values({
+        companyId, issueId, heartbeatRunId: sourceRunId, status: "active",
+      }).returning();
+      const staleSourceWakeId = await seedDeferredWake({ companyId, agentId: sourceAgentId, issueId,
+        requestedByActorType: "agent", requestedByActorId: sourceAgentId,
+        payload: { _paperclipWakeContext: { issueId, wakeReason: "issue_status_changed" } } });
+      const receiverWakeId = await seedDeferredWake({ companyId, agentId: receiverAgentId, issueId,
+        requestedByActorType: "agent", requestedByActorId: sourceAgentId,
+        payload: { interruptedRunId: sourceRunId,
+          _paperclipWakeContext: { issueId, wakeReason: "issue_assigned", interruptedRunId: sourceRunId } } });
+      const release = createReleaseIssueExecution({
+        issueLock: createPostgresWakeQueueAdapter(db, stubDeps),
+        recovery: {
+          escalateStrandedAssignedIssue: async () => { throw new Error("unexpected escalation"); },
+          escalateStrandedRecoveryIssueInPlace: async () => { throw new Error("unexpected escalation"); },
+        },
+      });
+      const releaseLease = () => db.update(environmentLeases)
+        .set({ status: "released", releasedAt: new Date() }).where(eq(environmentLeases.id, lease.id));
+      const wakeStatus = async (wakeId: string) =>
+        (await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, wakeId)))[0]?.status;
+      const runCount = async () => (await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).length;
+      return { companyId, sourceAgentId, receiverAgentId, issueId, sourceRunId, staleSourceWakeId, receiverWakeId,
+        release: () => release({ companyId, runId: sourceRunId, now: new Date() }), releaseLease, wakeStatus, runCount };
+    }
+
+    it("promotes only the new assignee's wake once the stopped source releases its lease", async () => {
+      const f = await seedHandoff();
+      // Receiver admission raced ahead of lease cleanup: nothing may start yet.
+      expect((await f.release()).outcome.kind).toBe("released");
+      expect(await f.wakeStatus(f.receiverWakeId)).toBe("deferred_issue_execution");
+      expect(await f.runCount()).toBe(1);
+
+      await f.releaseLease();
+      const result = await f.release();
+      expect(result.outcome.kind).toBe("promoted");
+      const promoted = result.outcome.kind === "promoted" ? result.outcome.run : null;
+      const [promotedRun] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, promoted!.id));
+      expect(promotedRun).toMatchObject({ agentId: f.receiverAgentId, status: "queued" });
+      expect(await f.wakeStatus(f.receiverWakeId)).not.toBe("deferred_issue_execution");
+      // The former owner's receipt is neither launched nor discarded.
+      expect(await f.wakeStatus(f.staleSourceWakeId)).toBe("deferred_issue_execution");
+
+      // A replay (cleanup retry or stranded sweep) cannot start a second run.
+      expect((await f.release()).outcome.kind).toBe("released");
+      expect(await f.runCount()).toBe(2);
+    });
+
+    it.each([
+      ["an operator Stop of the source", { sourceErrorCode: "cancelled" }],
+      ["a cancelled task", { issueStatus: "cancelled" }],
+      ["a done task", { issueStatus: "done" }],
+    ] as const)("keeps queued work parked after %s", async (_name, input) => {
+      const f = await seedHandoff(input);
+      await f.releaseLease();
+      expect((await f.release()).outcome.kind).toBe("released");
+      expect(await f.wakeStatus(f.receiverWakeId)).toBe("deferred_issue_execution");
+      expect(await f.wakeStatus(f.staleSourceWakeId)).toBe("deferred_issue_execution");
+      expect(await f.runCount()).toBe(1);
+    });
+
+    it("does not let an older reassignment bypass a later operator Stop of the receiver", async () => {
+      const f = await seedHandoff();
+      await f.releaseLease();
+      const receiverRunId = await seedRun({ companyId: f.companyId, agentId: f.receiverAgentId, status: "cancelled",
+        errorCode: "cancelled", contextSnapshot: { issueId: f.issueId } });
+      await db.update(heartbeatRuns).set({ runtimeMode: "legacy", createdAt: new Date(),
+        resultJson: { executionCancellation: { state: "acknowledged" }, conversationContinuation: "continue_conversation_v1" },
+      }).where(eq(heartbeatRuns.id, receiverRunId));
+
+      expect((await f.release()).outcome.kind).toBe("released");
+      expect(await f.wakeStatus(f.receiverWakeId)).toBe("deferred_issue_execution");
+      expect(await f.runCount()).toBe(2);
+    });
   });
 
   // The admission half opens no transaction of its own: `heartbeat.ts` still

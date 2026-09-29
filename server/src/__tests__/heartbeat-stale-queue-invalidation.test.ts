@@ -1504,6 +1504,71 @@ describeEmbeddedPostgres("heartbeat stale queued-run invalidation", () => {
     expect(promotedRun?.agentId).toBe(peerAgentId);
   });
 
+  it.each([
+    ["promotes the new assignee's parked wake after a reassignment Stop, even without a prior receiver run", false],
+    ["keeps the receiver's wake parked after a later operator Stop of the receiver", true],
+  ])("%s", async (_name, receiverStoppedLater) => {
+    const { companyId, agentId: sourceAgentId } = await seedCompanyAndAgent({ agentName: "SourceAgent" });
+    const receiverAgentId = randomUUID();
+    const issueId = randomUUID();
+    const sourceRunId = randomUUID();
+    const receiverWakeId = randomUUID();
+    await db.insert(agents).values({
+      id: receiverAgentId, companyId, name: "ReceiverAgent", role: "engineer", status: "active",
+      adapterType: "codex_local", adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } }, permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId, companyId, title: "Handoff work", status: "todo", priority: "high", assigneeAgentId: receiverAgentId,
+    });
+    const acknowledgedStop = {
+      executionCancellation: { state: "acknowledged" },
+      conversationContinuation: "continue_conversation_v1",
+    };
+    // The source run was stopped for reassignment and its lease cleanup has
+    // since finished; the receiver's admission parked while cleanup ran.
+    await db.insert(heartbeatRuns).values({
+      id: sourceRunId, companyId, agentId: sourceAgentId, invocationSource: "assignment", triggerDetail: "system",
+      status: "cancelled", errorCode: "issue_reassigned", runtimeMode: "legacy",
+      createdAt: new Date(Date.now() - 60_000), startedAt: new Date(Date.now() - 60_000), finishedAt: new Date(),
+      contextSnapshot: { issueId }, resultJson: { ...acknowledgedStop, reassignmentStopConfirmed: true },
+    });
+    if (receiverStoppedLater) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(), companyId, agentId: receiverAgentId, invocationSource: "on_demand", triggerDetail: "manual",
+        status: "cancelled", errorCode: "cancelled", runtimeMode: "legacy",
+        createdAt: new Date(), startedAt: new Date(), finishedAt: new Date(),
+        contextSnapshot: { issueId }, resultJson: acknowledgedStop,
+      });
+    }
+    await db.insert(agentWakeupRequests).values({
+      id: receiverWakeId, companyId, agentId: receiverAgentId, source: "assignment", triggerDetail: "system",
+      reason: "issue_assigned", status: "deferred_issue_execution",
+      requestedByActorType: "agent", requestedByActorId: sourceAgentId,
+      payload: { issueId, interruptedRunId: sourceRunId,
+        _paperclipWakeContext: { issueId, wakeReason: "issue_assigned", interruptedRunId: sourceRunId } },
+    });
+
+    await heartbeat.resumeQueuedRuns();
+
+    if (receiverStoppedLater) {
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receiverWakeId));
+      expect(wake).toMatchObject({ status: "deferred_issue_execution", runId: null });
+      expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.companyId, companyId))).toHaveLength(2);
+      return;
+    }
+    expect(await waitForCondition(async () => {
+      const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receiverWakeId));
+      return Boolean(wake?.runId) && wake.status !== "deferred_issue_execution";
+    })).toBe(true);
+    const [wake] = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, receiverWakeId));
+    const [promoted] = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, wake.runId!));
+    expect(promoted.agentId).toBe(receiverAgentId);
+    // The stopped former owner is never relaunched.
+    const sourceRuns = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, sourceAgentId));
+    expect(sourceRuns.map((run) => run.id)).toEqual([sourceRunId]);
+  });
+
   it("cancels queued max-turn continuations when another continuation owns the issue lock", async () => {
     const { companyId, agentId } = await seedCompanyAndAgent();
     const issueId = randomUUID();

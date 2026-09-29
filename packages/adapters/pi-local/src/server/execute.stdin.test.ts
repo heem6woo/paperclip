@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
-import { chmod, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdtemp, realpath, rm, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { expect, it } from "vitest";
 import { execute } from "./execute.js";
 
 it("launches fresh and resumed sessions with complete prompts larger than Linux's argument limit", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "pi-large-prompt-"));
+  const root = await realpath(await mkdtemp(path.join(os.tmpdir(), "pi-large-prompt-")));
   const command = path.join(root, "pi-fixture.cjs");
   const sessions = new Set<string>();
   await writeFile(command, `#!/usr/bin/env node
