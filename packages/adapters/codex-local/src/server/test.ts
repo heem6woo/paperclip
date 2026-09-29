@@ -26,6 +26,8 @@ import { codexHomeDir, readCodexAuthInfo } from "./quota.js";
 import { buildCodexExecArgs } from "./codex-args.js";
 import {
   isManagedCodexHomePath,
+  managedAgentIdForCodexHome,
+  prepareManagedAgentCodexHome,
   prepareManagedCodexHome,
   resolveSharedCodexHomeDir,
   seedManagedCodexHome,
@@ -109,7 +111,8 @@ async function prepareCodexHelloProbe(input: {
   if (input.targetIsRemote && !input.probeApiKey) {
     // Prepare the exact home a real run would use, mirroring execute.ts: vend
     // the shared credential's freshest same-identity cached copy, then seed the
-    // effective home — the company default when no CODEX_HOME is configured, a
+    // effective home — the company default when no CODEX_HOME is configured
+    // (the credential authority every per-agent default home links), a
     // Paperclip-managed override (the per-agent home) seeded in place — and
     // stage that home's credentials. A genuine external override manages its
     // own auth: its bytes are staged as-is and it is never seeded or mutated.
@@ -138,7 +141,16 @@ async function prepareCodexHelloProbe(input: {
         apiKey: null,
       });
     } else {
-      if (configuredHomeIsManaged) {
+      // A per-agent home (the server's persisted default) is seeded from the
+      // company credential authority, exactly as execute seeds it.
+      const configuredAgentId = input.managedAiConnection
+        ? null
+        : managedAgentIdForCodexHome(process.env, input.companyId, configuredCodexHome);
+      if (configuredAgentId) {
+        await prepareManagedAgentCodexHome(process.env, async () => {}, input.companyId, configuredAgentId, {
+          apiKey: null,
+        });
+      } else if (configuredHomeIsManaged) {
         await seedManagedCodexHome(configuredCodexHome, process.env, async () => {}, {
           apiKey: null,
         });

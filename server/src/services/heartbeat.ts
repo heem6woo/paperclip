@@ -19039,7 +19039,9 @@ export function heartbeatService(
     // A server restart or a message/cleanup race can leave a deferred wake
     // after its owner has released the issue lock. Revisit it through the same
     // release admission, so recovery holds and operator Stops still apply.
-    const strandedQueues = await db.select({ wake: agentWakeupRequests })
+    // A current assignee's wake parked behind a reassignment Stop is replayed
+    // through that stopped source run, even if the assignee has never run.
+    const strandedQueues = await db.select({ wake: agentWakeupRequests, issueStatus: issues.status })
       .from(agentWakeupRequests)
       .innerJoin(issues, and(eq(issues.companyId, agentWakeupRequests.companyId),
         sql`${issues.id}::text = ${agentWakeupRequests.payload}->>'issueId'`,
@@ -19047,20 +19049,36 @@ export function heartbeatService(
       .innerJoin(companies, and(eq(companies.id, issues.companyId), eq(companies.status, "active")))
       .where(and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
         isNull(issues.executionRunId),
-        sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
-        sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
+        or(and(
+          sql`jsonb_typeof(${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}') = 'array'`,
+          sql`${agentWakeupRequests.payload} #> '{_paperclipWakeContext,wakeCommentIds}' <> '[]'::jsonb`,
+        ), and(notInArray(issues.status, ["done", "cancelled"]), sql`exists (
+          select 1 from ${heartbeatRuns}
+          where ${heartbeatRuns.companyId} = ${agentWakeupRequests.companyId}
+            and ${heartbeatRuns.contextSnapshot}->>'issueId' = ${agentWakeupRequests.payload}->>'issueId'
+            and ${heartbeatRuns.agentId} <> ${agentWakeupRequests.agentId}
+            and ${heartbeatRuns.status} = 'cancelled' and ${heartbeatRuns.errorCode} = 'issue_reassigned')`)),
         sql`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is null`,
         cutoff ? gte(agentWakeupRequests.requestedAt, cutoff) : undefined))
       .orderBy(asc(agentWakeupRequests.updatedAt)).limit(50);
-    for (const { wake } of strandedQueues) {
-      if (!queuedCommentIdsFromWakePayload(wake.payload).length) continue;
-      const [latest] = await db.select().from(heartbeatRuns).where(and(
-        eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
-        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
-      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+    for (const { wake, issueStatus } of strandedQueues) {
+      // Advance the cursor first so a wake that no longer qualifies cannot
+      // starve later rows in this bounded scan.
       await db.update(agentWakeupRequests).set({ updatedAt: new Date() }).where(and(
         eq(agentWakeupRequests.id, wake.id), eq(agentWakeupRequests.status, "deferred_issue_execution"),
       ));
+      const [newest] = issueStatus === "done" || issueStatus === "cancelled" ? [] : await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, wake.companyId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
+      // Only the newest task run can hand off; a later receiver run or Stop wins.
+      const handoffSource = newest && newest.agentId !== wake.agentId && newest.runtimeMode === "legacy" &&
+        newest.status === "cancelled" && newest.errorCode === "issue_reassigned" ? newest : null;
+      if (!handoffSource && !queuedCommentIdsFromWakePayload(wake.payload).length) continue;
+      const [latest] = handoffSource ? [handoffSource] : await db.select().from(heartbeatRuns).where(and(
+        eq(heartbeatRuns.companyId, wake.companyId), eq(heartbeatRuns.agentId, wake.agentId),
+        sql`${heartbeatRuns.contextSnapshot}->>'issueId' = ${String(wake.payload?.issueId)}`,
+      )).orderBy(desc(heartbeatRuns.createdAt), desc(heartbeatRuns.id)).limit(1);
       if (!latest || latest.runtimeMode !== "legacy" || !isHeartbeatRunTerminalStatus(latest.status)) continue;
       const cancelledAdmission = latest.status === "cancelled" && !latest.startedAt &&
         latest.errorCode === "execution_reconciliation_required";
@@ -25650,12 +25668,19 @@ export function heartbeatService(
       }
       // Terminalization precedes lease and adapter cleanup. Only now is the
       // owner gone; retry pending input for ordinary completions as well as Stop.
+      // A reassignment Stop can leave the new assignee's wake parked behind this
+      // lease, so the current assignee's queue is retried as well.
       if (latestRun?.runtimeMode === "legacy" && isHeartbeatRunTerminalStatus(latestRun.status)) {
+        const pendingIssueId = String(latestRun.contextSnapshot?.issueId);
         const [pending] = await db.select({ id: agentWakeupRequests.id, payload: agentWakeupRequests.payload }).from(agentWakeupRequests).where(and(
-          eq(agentWakeupRequests.companyId, run.companyId), eq(agentWakeupRequests.agentId, run.agentId),
+          eq(agentWakeupRequests.companyId, run.companyId),
+          or(eq(agentWakeupRequests.agentId, run.agentId), sql`${agentWakeupRequests.agentId} = (
+            select ${issues.assigneeAgentId} from ${issues}
+            where ${issues.companyId} = ${run.companyId} and ${issues.id}::text = ${pendingIssueId})`),
           eq(agentWakeupRequests.status, "deferred_issue_execution"),
-          sql`${agentWakeupRequests.payload}->>'issueId' = ${String(latestRun.contextSnapshot?.issueId)}`,
-        )).limit(1);
+          sql`${agentWakeupRequests.payload}->>'issueId' = ${pendingIssueId}`,
+        )).orderBy(sql`case when ${agentWakeupRequests.agentId} = ${run.agentId} then 0 else 1 end`,
+          asc(agentWakeupRequests.requestedAt)).limit(1);
         if (pending) await (pending.payload?.queuedCommentInterrupt
           ? resumeQueuedCommentInterrupt(run.companyId, pending.id)
           : releaseIssueExecutionAndPromote(latestRun, { suppressImmediateRecovery: true })).catch(err => {

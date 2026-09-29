@@ -76,6 +76,8 @@ describe("agent-created hires use managed AI connections", () => {
       const f = await fixture(provider, method);
       const agent = hired(await request(f.app).post(`/api/companies/${f.companyId}/${endpoint}`).send({ name: "Teammate", role: "engineer", adapterType: f.adapterType, reportsTo: f.agentId }));
       expect(agent.runtimeConfig.aiConnection).toEqual(f.binding);
+      // The managed connection supplies its own per-run provider home.
+      expect(agent.adapterConfig.env?.CODEX_HOME).toBeUndefined();
       const runtime = await prepareManagedAiRuntime(db, { companyId: f.companyId, agentId: agent.id, responsibleUserId: f.userId, adapterType: agent.adapterType, binding: agent.runtimeConfig.aiConnection, config: agent.adapterConfig });
       try {
         expect(runtime.attribution).toMatchObject({ connectionId: f.account.connectionId, grantId: f.account.grantId, method, responsibleUserId: f.userId });
@@ -125,6 +127,11 @@ describe("agent-created hires use managed AI connections", () => {
       name: "Legacy authentication", role: "engineer", adapterType: f.adapterType,
     }));
     expect(agent.runtimeConfig.aiConnection).toBeUndefined();
+    const [saved] = await db.select().from(agents).where(eq(agents.id, agent.id));
+    expect((saved.adapterConfig.env as Record<string, unknown>).CODEX_HOME).toEqual({
+      type: "plain",
+      value: path.join(home, "instances", "hire-ai", "companies", f.companyId, "agents", agent.id, "codex-home"),
+    });
   });
 
   it.each(["anthropic", "openai"] as const)("%s can hire the other provider before that user connects it", async (provider) => {

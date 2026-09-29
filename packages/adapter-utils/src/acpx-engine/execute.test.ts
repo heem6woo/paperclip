@@ -172,6 +172,7 @@ async function runExecutor(
     runtimeMcp?: AdapterRuntimeMcpAccess;
     prepareRemoteManagedHome?: AcpxEngineExecutorOptions["prepareRemoteManagedHome"];
     startupTraceContext?: AdapterExecutionContext["startupTraceContext"];
+    agentId?: string;
   } = {},
 ) {
   const runtimeOptions: Record<string, unknown>[] = [];
@@ -198,7 +199,7 @@ async function runExecutor(
   const result = await execute({
     runId: "run-1",
     agent: {
-      id: "agent-1",
+      id: options.agentId ?? "agent-1",
       companyId: "company-1",
     },
       runtime: options.runtime ?? {},
@@ -1544,6 +1545,136 @@ describe("shared ACPX engine runtime behavior", () => {
     const authStat = await fs.lstat(managedAuth);
     expect(authStat.isSymbolicLink()).toBe(true);
     expect(path.resolve(path.dirname(managedAuth), await fs.readlink(managedAuth))).toBe(sourceAuth);
+  });
+
+  describe("per-agent default ACPX Codex homes", () => {
+    let restoreEnv: () => void = () => {};
+
+    afterEach(() => restoreEnv());
+
+    async function setupInstance() {
+      const root = await makeTempRoot();
+      const sourceCodexHome = path.join(root, "source-codex-home");
+      const paperclipHome = path.join(root, "paperclip-home");
+      const companyRoot = path.join(paperclipHome, "instances", "default", "companies", "company-1");
+      await fs.mkdir(sourceCodexHome, { recursive: true });
+      await fs.writeFile(path.join(sourceCodexHome, "auth.json"), "{\"source\":true}", "utf8");
+      const previous = {
+        CODEX_HOME: process.env.CODEX_HOME,
+        PAPERCLIP_HOME: process.env.PAPERCLIP_HOME,
+        PAPERCLIP_INSTANCE_ID: process.env.PAPERCLIP_INSTANCE_ID,
+      };
+      restoreEnv = () => {
+        for (const [key, value] of Object.entries(previous)) {
+          if (value === undefined) delete process.env[key];
+          else process.env[key] = value;
+        }
+      };
+      process.env.CODEX_HOME = sourceCodexHome;
+      process.env.PAPERCLIP_HOME = paperclipHome;
+      process.env.PAPERCLIP_INSTANCE_ID = "default";
+      return {
+        root,
+        sourceCodexHome,
+        companyCodexHome: path.join(companyRoot, "codex-home"),
+        agentCodexHome: (agentId: string) => path.join(companyRoot, "agents", agentId, "codex-home"),
+      };
+    }
+
+    it.skipIf(process.platform === "win32")("keeps each agent's materialized skills readable while another agent in the company runs", async () => {
+      const { root, sourceCodexHome, companyCodexHome, agentCodexHome } = await setupInstance();
+      const skillRoot = path.join(root, "skills");
+      const collector = await createSkill(skillRoot, "collector-skill");
+      const publisher = await createSkill(skillRoot, "publisher-skill");
+      await fs.mkdir(path.join(publisher.source, "references"), { recursive: true });
+      await fs.writeFile(path.join(publisher.source, "references", "contract.md"), "publish contract", "utf8");
+      const sharedConfig = {
+        agent: "codex",
+        paperclipRuntimeSkills: [collector, publisher],
+      };
+      const publisherReference = path.join(
+        agentCodexHome("publisher"), "skills", publisher.runtimeName, "references", "contract.md",
+      );
+
+      const publisherRun = await runExecutor(
+        { ...sharedConfig, stateDir: path.join(root, "state-publisher"), paperclipSkillSync: { desiredSkills: [publisher.key] } },
+        { agentId: "publisher" },
+      );
+      // The collector starts while the publisher's session is still reading its
+      // skill references; its own desired-skill reconciliation must not reach them.
+      const collectorRun = await runExecutor(
+        { ...sharedConfig, stateDir: path.join(root, "state-collector"), paperclipSkillSync: { desiredSkills: [collector.key] } },
+        { agentId: "collector" },
+      );
+
+      expect(publisherRun.sessionInputs[0]).toMatchObject({
+        sessionOptions: { env: expect.objectContaining({ CODEX_HOME: agentCodexHome("publisher") }) },
+      });
+      expect(collectorRun.sessionInputs[0]).toMatchObject({
+        sessionOptions: { env: expect.objectContaining({ CODEX_HOME: agentCodexHome("collector") }) },
+      });
+      expect(await fs.readFile(publisherReference, "utf8")).toBe("publish contract");
+      expect(await pathExists(path.join(agentCodexHome("collector"), "skills", collector.runtimeName, "SKILL.md"))).toBe(true);
+      expect(await pathExists(path.join(agentCodexHome("collector"), "skills", publisher.runtimeName))).toBe(false);
+      expect(await pathExists(path.join(companyCodexHome, "skills"))).toBe(false);
+
+      // Both homes link the company credential, which stays linked to the source.
+      for (const agentId of ["publisher", "collector"]) {
+        expect(await fs.readlink(path.join(agentCodexHome(agentId), "auth.json"))).toBe(path.join(companyCodexHome, "auth.json"));
+      }
+      expect(await fs.readlink(path.join(companyCodexHome, "auth.json"))).toBe(path.join(sourceCodexHome, "auth.json"));
+
+      // An agent that deselects its own skill still has it revoked from its home.
+      await runExecutor(
+        { ...sharedConfig, stateDir: path.join(root, "state-publisher"), paperclipSkillSync: { desiredSkills: [] } },
+        { agentId: "publisher" },
+      );
+      expect(await pathExists(path.join(agentCodexHome("publisher"), "skills", publisher.runtimeName))).toBe(false);
+      expect(await pathExists(path.join(agentCodexHome("collector"), "skills", collector.runtimeName, "SKILL.md"))).toBe(true);
+    });
+
+    it.skipIf(process.platform === "win32")("seeds the persisted per-agent home from a promoted company credential and leaves external homes untouched", async () => {
+      const { root, sourceCodexHome, companyCodexHome, agentCodexHome } = await setupInstance();
+      const subscription = (accountId: string) => JSON.stringify({
+        tokens: { access_token: `synthetic-${accountId}`, refresh_token: `synthetic-${accountId}`, account_id: accountId },
+        last_refresh: "2026-07-09T00:00:00Z",
+      });
+      // The company holds a promoted device-login credential for a different
+      // account than the host login; seeding must not swap it for the host.
+      const promoted = subscription("acct-company");
+      await fs.writeFile(path.join(sourceCodexHome, "auth.json"), subscription("acct-host"), "utf8");
+      await fs.mkdir(companyCodexHome, { recursive: true });
+      await fs.writeFile(path.join(companyCodexHome, "auth.json"), promoted, "utf8");
+
+      const perAgentRun = await runExecutor({
+        agent: "codex",
+        stateDir: path.join(root, "state-explicit"),
+        env: { CODEX_HOME: agentCodexHome("agent-1"), OPENAI_API_KEY: "" },
+        paperclipRuntimeSkills: [],
+        paperclipSkillSync: { desiredSkills: [] },
+      });
+      expect(perAgentRun.sessionInputs[0]).toMatchObject({
+        sessionOptions: { env: expect.objectContaining({ CODEX_HOME: agentCodexHome("agent-1") }) },
+      });
+      expect(await fs.readlink(path.join(agentCodexHome("agent-1"), "auth.json"))).toBe(path.join(companyCodexHome, "auth.json"));
+      expect(await fs.readFile(path.join(agentCodexHome("agent-1"), "auth.json"), "utf8")).toBe(promoted);
+      expect((await fs.lstat(path.join(companyCodexHome, "auth.json"))).isSymbolicLink()).toBe(false);
+      expect(await fs.readFile(path.join(companyCodexHome, "auth.json"), "utf8")).toBe(promoted);
+
+      const externalHome = path.join(root, "external-codex-home");
+      const externalRun = await runExecutor({
+        agent: "codex",
+        stateDir: path.join(root, "state-external"),
+        env: { CODEX_HOME: externalHome },
+        paperclipRuntimeSkills: [],
+        paperclipSkillSync: { desiredSkills: [] },
+      }, { agentId: "agent-2" });
+      expect(externalRun.sessionInputs[0]).toMatchObject({
+        sessionOptions: { env: expect.objectContaining({ CODEX_HOME: externalHome }) },
+      });
+      expect(await pathExists(path.join(externalHome, "auth.json"))).toBe(false);
+      expect(await pathExists(agentCodexHome("agent-2"))).toBe(false);
+    });
   });
 
   it("sets GROK_HOME for a Grok run from the company Grok home, and leaves CODEX_HOME unchanged for a Codex run", async () => {

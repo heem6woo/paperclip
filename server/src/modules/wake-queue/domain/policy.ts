@@ -72,7 +72,7 @@ export type PreDrainFacts = {
   hasAssigneeUser: boolean;
   assigneeAgentMatchesRunAgent: boolean;
   legacyExecutionNeedsReconciliation: boolean;
-  /** True when the finishing run is cancelled and its stored result carries an acknowledged execution cancellation. */
+  /** True when the finishing run is cancelled and its stored result carries an acknowledged execution cancellation, except a newest-run reassignment Stop that hands an open task to its new assignee. */
   executionCancellationAcknowledged: boolean;
 };
 

@@ -14,6 +14,12 @@ export type { InvokableAgentSnapshot, IssueSnapshot, ReleaseRecoveryBlockedNotic
 export type LockedIssueExecution = {
   /** Plan bounded recovery without draining messages while the finishing owner cleans up. */
   recoveryOnly?: boolean;
+  /**
+   * The finishing run was stopped only to hand the task to another agent and
+   * is the newest run on the issue. Only the current assignee's deferred wakes
+   * may promote; other receipts stay intact and no recovery successor starts.
+   */
+  assigneeHandoffOnly?: boolean;
   primaryIssue: IssueSnapshot;
   run: RunSnapshot;
 };

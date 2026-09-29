@@ -1052,6 +1052,22 @@ function ConfirmationCard({
   );
 }
 
+/**
+ * Stored drafts and payload defaults may name IDs the current interaction does
+ * not offer; accepting those is rejected by the server, so keep current IDs only.
+ */
+function selectionFromCurrentIds(
+  ids: readonly unknown[],
+  currentIds: readonly string[],
+): Set<string> {
+  const current = new Set(currentIds);
+  return new Set(
+    ids.filter(
+      (id): id is string => typeof id === "string" && current.has(id),
+    ),
+  );
+}
+
 function CheckboxConfirmationCard({
   interaction,
   onAcceptInteraction,
@@ -1067,22 +1083,26 @@ function CheckboxConfirmationCard({
   errorMessage: (error: unknown) => string;
   draftKey?: string;
 }) {
-  const restored = draftKey
-    ? loadStructuredDraft<{ selected: string[]; reason: string }>(draftKey, {
-        selected: interaction.payload.defaultSelectedOptionIds ?? [],
-        reason: "",
-      })
-    : null;
-  const [selected, setSelected] = useState(
-    () =>
-      new Set(
-        restored?.selected ??
-          interaction.payload.defaultSelectedOptionIds ??
-          [],
+  const [initial] = useState(() => {
+    const saved = draftKey
+      ? loadStructuredDraft<{ selected?: unknown; reason?: unknown } | null>(
+          draftKey,
+          null,
+        )
+      : null;
+    return {
+      selected: selectionFromCurrentIds(
+        Array.isArray(saved?.selected)
+          ? saved.selected
+          : (interaction.payload.defaultSelectedOptionIds ?? []),
+        interaction.payload.options.map((option) => option.id),
       ),
-  );
+      reason: typeof saved?.reason === "string" ? saved.reason : "",
+    };
+  });
+  const [selected, setSelected] = useState(initial.selected);
   const [rejecting, setRejecting] = useState(false);
-  const [reason, setReason] = useState(restored?.reason ?? "");
+  const [reason, setReason] = useState(initial.reason);
   const [filter, setFilter] = useState("");
   const [working, setWorking] = useState<"accept" | "reject" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -1362,21 +1382,25 @@ function SuggestedTasksCard({
       new Map(interaction.payload.tasks.map((task) => [task.clientKey, task])),
     [interaction.payload.tasks],
   );
-  const restored = draftKey
-    ? loadStructuredDraft<{ selected: string[]; reason: string }>(draftKey, {
-        selected: interaction.payload.tasks.map((task) => task.clientKey),
-        reason: "",
-      })
-    : null;
-  const [selected, setSelected] = useState(
-    () =>
-      new Set(
-        restored?.selected ??
-          interaction.payload.tasks.map((task) => task.clientKey),
+  const [initial] = useState(() => {
+    const saved = draftKey
+      ? loadStructuredDraft<{ selected?: unknown; reason?: unknown } | null>(
+          draftKey,
+          null,
+        )
+      : null;
+    const clientKeys = interaction.payload.tasks.map((task) => task.clientKey);
+    return {
+      selected: selectionFromCurrentIds(
+        Array.isArray(saved?.selected) ? saved.selected : clientKeys,
+        clientKeys,
       ),
-  );
+      reason: typeof saved?.reason === "string" ? saved.reason : "",
+    };
+  });
+  const [selected, setSelected] = useState(initial.selected);
   const [rejecting, setRejecting] = useState(false);
-  const [reason, setReason] = useState(restored?.reason ?? "");
+  const [reason, setReason] = useState(initial.reason);
   const [filter, setFilter] = useState("");
   const [working, setWorking] = useState<"accept" | "reject" | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -1574,15 +1598,34 @@ function ItemVerdictsCard({
     items.findIndex((item) => !resolvedById.has(item.id)),
     0,
   );
-  const restored = draftKey
-    ? loadStructuredDraft<{
-        page: number;
-        drafts: Array<[string, VerdictDraft]>;
-      }>(draftKey, { page: firstPendingIndex, drafts: [] })
-    : null;
-  const [page, setPage] = useState(restored?.page ?? firstPendingIndex);
+  const [initial] = useState(() => {
+    const saved = draftKey
+      ? loadStructuredDraft<{ page?: unknown; drafts?: unknown } | null>(
+          draftKey,
+          null,
+        )
+      : null;
+    const pendingIds = new Set(
+      items.filter((item) => !resolvedById.has(item.id)).map((item) => item.id),
+    );
+    const drafts = Array.isArray(saved?.drafts)
+      ? saved.drafts.filter(
+          (entry): entry is [string, VerdictDraft] =>
+            Array.isArray(entry) &&
+            typeof entry[0] === "string" &&
+            pendingIds.has(entry[0]) &&
+            typeof entry[1]?.verdict === "string" &&
+            typeof entry[1]?.reason === "string",
+        )
+      : [];
+    return {
+      page: typeof saved?.page === "number" ? saved.page : firstPendingIndex,
+      drafts,
+    };
+  });
+  const [page, setPage] = useState(initial.page);
   const [drafts, setDrafts] = useState<Map<string, VerdictDraft>>(
-    () => new Map(restored?.drafts ?? []),
+    () => new Map(initial.drafts),
   );
   const [working, setWorking] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -1955,6 +1998,9 @@ export function TaskChatCompactInteractionCard({
     );
   }
 
+  // Pending-card state is seeded once from the draft; a new interaction or
+  // draft slot must remount it so selections never carry across.
+  const pendingBodyKey = `${interaction.id}:${draftKey ?? ""}`;
   return (
     <InteractionShell
       interaction={interaction}
@@ -1968,6 +2014,7 @@ export function TaskChatCompactInteractionCard({
         />
       ) : interaction.kind === "ask_user_questions" ? (
         <AskUserQuestionsCard
+          key={pendingBodyKey}
           interaction={interaction}
           onSubmitInteractionAnswers={onSubmitInteractionAnswers}
           onCancelInteraction={
@@ -1980,6 +2027,7 @@ export function TaskChatCompactInteractionCard({
         />
       ) : interaction.kind === "request_confirmation" ? (
         <ConfirmationCard
+          key={pendingBodyKey}
           interaction={interaction}
           planDocument={planDocument}
           onAcceptInteraction={onAcceptInteraction}
@@ -1993,6 +2041,7 @@ export function TaskChatCompactInteractionCard({
         />
       ) : interaction.kind === "request_checkbox_confirmation" ? (
         <CheckboxConfirmationCard
+          key={pendingBodyKey}
           interaction={interaction}
           onAcceptInteraction={onAcceptInteraction}
           onRejectInteraction={onRejectInteraction}
@@ -2002,6 +2051,7 @@ export function TaskChatCompactInteractionCard({
         />
       ) : interaction.kind === "suggest_tasks" ? (
         <SuggestedTasksCard
+          key={pendingBodyKey}
           interaction={interaction}
           onAcceptInteraction={onAcceptInteraction}
           onRejectInteraction={onRejectInteraction}
@@ -2010,6 +2060,7 @@ export function TaskChatCompactInteractionCard({
         />
       ) : (
         <ItemVerdictsCard
+          key={pendingBodyKey}
           interaction={interaction}
           onSubmitInteractionVerdicts={onSubmitInteractionVerdicts}
           externalReferences={externalReferences}

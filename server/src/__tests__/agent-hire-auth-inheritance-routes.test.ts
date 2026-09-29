@@ -393,6 +393,19 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     expect(children).toHaveLength(0);
   });
 
+  async function savedChildEnv(res: request.Response): Promise<Record<string, unknown>> {
+    const [row] = await db.select().from(agents).where(eq(agents.id, res.body.agent.id as string));
+    return ((row?.adapterConfig as { env?: Record<string, unknown> } | undefined)?.env) ?? {};
+  }
+
+  function expectPerAgentCodexHome(binding: unknown, companyId: string, agentId: string) {
+    // A bare environment string persists as a `plain` binding.
+    const home = binding as { type?: unknown; value?: unknown } | undefined;
+    expect(home?.type).toBe("plain");
+    expect(path.isAbsolute(String(home?.value))).toBe(true);
+    expect(String(home?.value).endsWith(path.join("companies", companyId, "agents", agentId, "codex-home"))).toBe(true);
+  }
+
   it("carves out a per-agent CODEX_HOME when the child inherits OPENAI_API_KEY", async () => {
     const companyId = await seedCompany();
     const secret = await createCompanySecret(companyId, "sk-openai-isolated");
@@ -407,25 +420,40 @@ describeEmbeddedPostgres("hired agent provider credential inheritance", () => {
     });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
-    const childEnv = childEnvOf(res);
-    // A bare environment string persists as a `plain` binding.
-    const codexHome = childEnv.CODEX_HOME as { type: string; value: string } | undefined;
-    expect(codexHome?.type).toBe("plain");
-    expect(codexHome?.value.length ?? 0).toBeGreaterThan(0);
+    const childEnv = await savedChildEnv(res);
+    expect(childEnv.OPENAI_API_KEY).toMatchObject({ type: "secret_ref", secretId: secret.id });
+    expectPerAgentCodexHome(childEnv.CODEX_HOME, companyId, res.body.agent.id as string);
   });
 
-  it("keeps the shared company Codex home when the child inherits no key", async () => {
+  it("gives a keyless child its own per-agent Codex home and inherits no credential", async () => {
     const companyId = await seedCompany();
     const parent = await seedParentAgent(companyId, "codex_local", {});
 
     const res = await hire(agentActor(companyId, parent.id), companyId, {
-      name: "Codex Shared Home Child",
+      name: "Codex Subscription Child",
       role: "engineer",
       adapterType: "codex_local",
     });
 
     expect(res.status, JSON.stringify(res.body)).toBe(201);
-    expect(childEnvOf(res).CODEX_HOME).toBeUndefined();
+    const { CODEX_HOME: codexHome, ...otherEnv } = await savedChildEnv(res);
+    expectPerAgentCodexHome(codexHome, companyId, res.body.agent.id as string);
+    expect(otherEnv).toEqual({});
+  });
+
+  it("keeps a child's explicit CODEX_HOME instead of the per-agent default", async () => {
+    const companyId = await seedCompany();
+    const parent = await seedParentAgent(companyId, "codex_local", {});
+
+    const res = await hire(agentActor(companyId, parent.id), companyId, {
+      name: "Codex External Home Child",
+      role: "engineer",
+      adapterType: "codex_local",
+      adapterConfig: { env: { CODEX_HOME: "/srv/shared-codex" } },
+    });
+
+    expect(res.status, JSON.stringify(res.body)).toBe(201);
+    expect(await savedChildEnv(res)).toEqual({ CODEX_HOME: { type: "plain", value: "/srv/shared-codex" } });
   });
 
   it("adds no home override for a grok_local child with no inherited key", async () => {

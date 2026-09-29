@@ -167,6 +167,13 @@ async function runReleaseDrain(
     }
     processedWakeIds.add(candidate.id);
 
+    // A reassignment Stop releases work only to the new assignee. Former-owner
+    // receipts stay intact for that assignee's admission to adopt or discard.
+    if (locked.assigneeHandoffOnly && candidate.agentId !== issue.assigneeAgentId) {
+      handoffWakeIds.push(candidate.id);
+      continue;
+    }
+
     // A lead can post its closing comment before committing Done. Check
     // again when the source run releases its queue, using every original
     // comment ID so coalesced human or unrelated input is never hidden.
@@ -308,6 +315,8 @@ async function runReleaseDrain(
     return promoted;
   }
 
+  // The stopped former owner has no recovery claim on a task it no longer owns.
+  if (locked.assigneeHandoffOnly) return { outcome: { kind: "released" }, postCommitEffects };
   return runReleaseRecoveryTail(issue, run, ports.host, ports.transaction, input, postCommitEffects);
 }
 

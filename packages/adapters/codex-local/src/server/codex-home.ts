@@ -141,6 +141,47 @@ export function resolveManagedCodexHomeDir(
 }
 
 /**
+ * The per-agent managed home, `<instanceRoot>/companies/<companyId>/agents/<agentId>/codex-home`,
+ * the same path the server isolation guard persists. It holds the agent's
+ * mutable Codex state (skills, config edits, sessions) so two agents in one
+ * company never reconcile each other's skill directories.
+ */
+export function resolveManagedAgentCodexHomeDir(
+  env: NodeJS.ProcessEnv,
+  companyId: string,
+  agentId: string,
+): string {
+  for (const segment of [companyId, agentId]) {
+    if (!segment.trim() || segment.includes("/") || segment.includes("\\") || segment === "." || segment === "..") {
+      throw new Error("resolveManagedAgentCodexHomeDir: companyId and agentId must each be one safe path segment");
+    }
+  }
+  return path.resolve(resolveManagedCodexHomeDir(env, companyId), "..", "agents", agentId, "codex-home");
+}
+
+/**
+ * The agent id when `home` is exactly a per-agent managed home of `companyId`
+ * (`resolveManagedAgentCodexHomeDir`), else null. Such a home is seeded from the
+ * company home — the credential authority — never directly from the shared
+ * source, so a promoted company credential is not swapped for the host login.
+ */
+export function managedAgentIdForCodexHome(
+  env: NodeJS.ProcessEnv,
+  companyId: string | undefined,
+  home: string,
+): string | null {
+  if (!companyId) return null;
+  const resolved = path.resolve(home);
+  if (path.basename(resolved) !== "codex-home") return null;
+  const agentId = path.basename(path.dirname(resolved));
+  try {
+    return resolveManagedAgentCodexHomeDir(env, companyId, agentId) === resolved ? agentId : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * True when `homePath` lives under the Paperclip-managed company tree
  * (`<instanceRoot>/companies/<companyId>/...`). This covers both the shared
  * company `codex-home` and the per-agent `agents/<agentId>/codex-home` set by
@@ -775,6 +816,28 @@ export async function prepareManagedCodexHome(
   return targetHome;
 }
 
+/**
+ * Prepares the default home for an agent with no configured `CODEX_HOME`. The
+ * company home stays the credential authority: it is prepared exactly as the
+ * shared default always was (seeded from the shared source, a promoted company
+ * credential kept), and the per-agent home is then seeded FROM the company
+ * home, so its `auth.json` links to the company credential rather than
+ * re-deciding identity from the host. A configured API key is written only
+ * into the per-agent home, never into the shared company home.
+ */
+export async function prepareManagedAgentCodexHome(
+  env: NodeJS.ProcessEnv,
+  onLog: AdapterExecutionContext["onLog"],
+  companyId: string,
+  agentId: string,
+  options: { apiKey?: string | null } = {},
+): Promise<string> {
+  const agentHome = resolveManagedAgentCodexHomeDir(env, companyId, agentId);
+  const companyHome = await prepareManagedCodexHome(env, onLog, companyId);
+  await seedManagedCodexHome(agentHome, { ...env, CODEX_HOME: companyHome }, onLog, options);
+  return agentHome;
+}
+
 export type ReconcileManagedCodexHomeStatus =
   | "no_managed_home"
   | "external_override"
@@ -844,7 +907,12 @@ export async function reconcileManagedCodexHome(
     return { status: "already_seeded", home: resolved };
   }
 
-  await seedManagedCodexHome(resolved, env, input.onLog ?? noopOnLog, { apiKey });
+  const agentId = managedAgentIdForCodexHome(env, input.companyId, resolved);
+  if (agentId && input.companyId) {
+    await prepareManagedAgentCodexHome(env, input.onLog ?? noopOnLog, input.companyId, agentId, { apiKey });
+  } else {
+    await seedManagedCodexHome(resolved, env, input.onLog ?? noopOnLog, { apiKey });
+  }
 
   if (!apiKey && !(await codexHomeHasUsableAuth(resolved))) {
     return { status: "source_auth_missing", home: resolved };
@@ -924,8 +992,13 @@ export async function evaluateCodexCredentialReadiness(
     return { managed: true, authMode: "api", ready: true, effectiveHome, sharedSourceHome };
   }
 
+  // A per-agent home is seeded from the company home, which holds either the
+  // shared-source link or a promoted company credential.
   const ready =
     (await codexHomeHasUsableAuth(effectiveHome)) ||
+    (configuredCodexHome != null &&
+      managedAgentIdForCodexHome(env, input.companyId, configuredCodexHome) != null &&
+      (await codexHomeHasUsableAuth(resolveManagedCodexHomeDir(env, input.companyId)))) ||
     (await codexHomeHasUsableAuth(sharedSourceHome));
   return { managed: true, authMode: "subscription", ready, effectiveHome, sharedSourceHome };
 }

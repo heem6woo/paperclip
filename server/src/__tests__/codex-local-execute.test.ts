@@ -119,19 +119,29 @@ function createLocalSandboxRunner() {
 }
 
 describe("codex execute", () => {
-  it("uses a Paperclip-managed CODEX_HOME outside worktree mode while preserving shared auth and config", async () => {
+  it("runs a legacy agent without CODEX_HOME in its own managed home that links the company credential authority", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-default-"));
     const workspace = path.join(root, "workspace");
     const commandPath = path.join(root, "codex");
     const capturePath = path.join(root, "capture.json");
     const sharedCodexHome = path.join(root, "shared-codex-home");
     const paperclipHome = path.join(root, "paperclip-home");
+    const companyCodexHome = path.join(
+      paperclipHome,
+      "instances",
+      "default",
+      "companies",
+      "company-1",
+      "codex-home",
+    );
     const managedCodexHome = path.join(
       paperclipHome,
       "instances",
       "default",
       "companies",
       "company-1",
+      "agents",
+      "agent-1",
       "codex-home",
     );
     await fs.mkdir(workspace, { recursive: true });
@@ -195,7 +205,10 @@ describe("codex execute", () => {
 
       const managedAuth = path.join(managedCodexHome, "auth.json");
       const managedConfig = path.join(managedCodexHome, "config.toml");
-      expect((await fs.lstat(managedAuth)).isSymbolicLink()).toBe(true);
+      // The agent home links the company home's auth.json (the authority), which
+      // in turn links the shared source — identity is never re-decided per agent.
+      expect(await fs.readlink(managedAuth)).toBe(path.join(companyCodexHome, "auth.json"));
+      expect(await fs.readlink(path.join(companyCodexHome, "auth.json"))).toBe(path.join(sharedCodexHome, "auth.json"));
       expect(await fs.realpath(managedAuth)).toBe(await fs.realpath(path.join(sharedCodexHome, "auth.json")));
       expect((await fs.lstat(managedConfig)).isFile()).toBe(true);
       expect(await fs.readFile(managedConfig, "utf8")).toBe('model = "codex-mini-latest"\n');
@@ -206,6 +219,91 @@ describe("codex execute", () => {
           chunk: expect.stringContaining("Using Paperclip-managed Codex home"),
         }),
       );
+    } finally {
+      if (previousHome === undefined) delete process.env.HOME;
+      else process.env.HOME = previousHome;
+      if (previousPaperclipHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = previousPaperclipHome;
+      if (previousPaperclipInstanceId === undefined) delete process.env.PAPERCLIP_INSTANCE_ID;
+      else process.env.PAPERCLIP_INSTANCE_ID = previousPaperclipInstanceId;
+      if (previousPaperclipInWorktree === undefined) delete process.env.PAPERCLIP_IN_WORKTREE;
+      else process.env.PAPERCLIP_IN_WORKTREE = previousPaperclipInWorktree;
+      if (previousCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = previousCodexHome;
+      await fs.rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("seeds a persisted own per-agent CODEX_HOME from a promoted company credential, not the host login", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-codex-execute-persisted-agent-home-"));
+    const workspace = path.join(root, "workspace");
+    const commandPath = path.join(root, "codex");
+    const capturePath = path.join(root, "capture.json");
+    const sharedCodexHome = path.join(root, "shared-codex-home");
+    const paperclipHome = path.join(root, "paperclip-home");
+    const companyRoot = path.join(paperclipHome, "instances", "default", "companies", "company-1");
+    const companyCodexHome = path.join(companyRoot, "codex-home");
+    const agentCodexHome = path.join(companyRoot, "agents", "agent-1", "codex-home");
+    const subscription = (accountId: string) => JSON.stringify({
+      tokens: { access_token: `synthetic-${accountId}`, refresh_token: `synthetic-${accountId}`, account_id: accountId },
+      last_refresh: "2026-07-09T00:00:00Z",
+    });
+    const promoted = subscription("acct-company");
+    await fs.mkdir(workspace, { recursive: true });
+    await fs.mkdir(sharedCodexHome, { recursive: true });
+    await fs.writeFile(path.join(sharedCodexHome, "auth.json"), subscription("acct-host"), "utf8");
+    await fs.mkdir(companyCodexHome, { recursive: true });
+    await fs.writeFile(path.join(companyCodexHome, "auth.json"), promoted, "utf8");
+    await writeFakeCodexCommand(commandPath);
+
+    const previousHome = process.env.HOME;
+    const previousPaperclipHome = process.env.PAPERCLIP_HOME;
+    const previousPaperclipInstanceId = process.env.PAPERCLIP_INSTANCE_ID;
+    const previousPaperclipInWorktree = process.env.PAPERCLIP_IN_WORKTREE;
+    const previousCodexHome = process.env.CODEX_HOME;
+    process.env.HOME = root;
+    process.env.PAPERCLIP_HOME = paperclipHome;
+    delete process.env.PAPERCLIP_INSTANCE_ID;
+    delete process.env.PAPERCLIP_IN_WORKTREE;
+    process.env.CODEX_HOME = sharedCodexHome;
+
+    try {
+      const result = await execute({
+        runId: "run-persisted-agent-home",
+        agent: {
+          id: "agent-1",
+          companyId: "company-1",
+          name: "Codex Coder",
+          adapterType: "codex_local",
+          adapterConfig: { engine: "cli" },
+        },
+        runtime: {
+          sessionId: null,
+          sessionParams: null,
+          sessionDisplayId: null,
+          taskKey: null,
+        },
+        config: {
+          engine: "cli",
+          command: commandPath,
+          cwd: workspace,
+          // The shape the server persists for a new unmanaged, keyless agent.
+          env: { CODEX_HOME: agentCodexHome, OPENAI_API_KEY: "", PAPERCLIP_TEST_CAPTURE_PATH: capturePath },
+          promptTemplate: "Follow the paperclip heartbeat.",
+        },
+        context: {},
+        authToken: "run-jwt-token",
+        onLog: async () => {},
+      });
+
+      expect(result.exitCode).toBe(0);
+      const capture = JSON.parse(await fs.readFile(capturePath, "utf8")) as CapturePayload;
+      expect(capture.codexHome).toBe(agentCodexHome);
+      const agentAuth = path.join(agentCodexHome, "auth.json");
+      expect(await fs.readlink(agentAuth)).toBe(path.join(companyCodexHome, "auth.json"));
+      expect(await fs.readFile(agentAuth, "utf8")).toBe(promoted);
+      expect((await fs.lstat(path.join(companyCodexHome, "auth.json"))).isSymbolicLink()).toBe(false);
+      expect(await fs.readFile(path.join(companyCodexHome, "auth.json"), "utf8")).toBe(promoted);
     } finally {
       if (previousHome === undefined) delete process.env.HOME;
       else process.env.HOME = previousHome;
@@ -1398,6 +1496,8 @@ process.exit(1);
       "worktree-1",
       "companies",
       "company-1",
+      "agents",
+      "agent-1",
       "codex-home",
     );
     const homeSkill = path.join(isolatedCodexHome, "skills", "paperclip");
