@@ -682,9 +682,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
       if (extraArgs.length > 0) args.push(...extraArgs);
 
-      // Add the user prompt as the last argument
-      args.push(userPrompt);
-
       return args;
     };
 
@@ -730,6 +727,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       const proc = await runAdapterExecutionTargetProcess(runId, runtimeExecutionTarget, command, args, {
         cwd,
         env: executionTargetIsRemote ? env : runtimeEnv,
+        // Keep full wake history out of argv: Linux limits each argument to 128 KiB.
+        stdin: userPrompt,
         timeoutSec,
         graceSec,
         onSpawn,
